@@ -9,7 +9,7 @@ import requests
 
 LOG_FILE = 'frigate_alpr.log'
 _LOGGER = None
-VERSION = '0.0.1'
+VERSION = '0.1.2'
 CURRENT_EVENTS = None # For implementation
 mqtt_client = None
 # Load configuration
@@ -18,6 +18,13 @@ with open("/config/config.yml", "r") as file:
 
     frigate_url = config['frigate']['url']
     carmen_api_key = config['carmen']['api_key']
+    cameras_str = config['frigate']['cameras']
+    if cameras_str:
+        cameras_list = cameras_str.split(",")
+        cameras_list = [cameras.strip() for cameras in cameras_list]
+        print("Watched cameras:", cameras_list)
+    else:
+        _LOGGER.info(f"No watched cameras provided in the config.")
 
 def load_logger():
     global _LOGGER
@@ -113,71 +120,75 @@ def on_message(client, userdata, message):
     frigate_event_id = after_data['data']['detections'][0]
     frigate_review_id = after_data['id']
     detected_object = after_data['data']['objects'][0]
+    camera = after_data['camera']
 
     ### Is the received object a car? If not, skip
     _LOGGER.debug(f"Received message - eventid {frigate_event_id}, reviewid {frigate_review_id}")
-    if detected_object != "car":
-        _LOGGER.info(f"Detected object '{detected_object}' is not a car; skipping")
+    if camera not in cameras_list:
+        _LOGGER.info(f"Camera {camera} not in watched camera list; skipping. ")
         return
-    
-    snapshot = get_snapshot(frigate_event_id, frigate_url, True)
-    if not snapshot:
-        if frigate_event_id in CURRENT_EVENTS:
-            del CURRENT_EVENTS[frigate_event_id] # remove existing id from current events due to snapshot failure - will try again next frame
+    elif detected_object != "car":
+        _LOGGER.info(f"Detected object '{detected_object}' is not a car; skipping. ")
         return
+    else:
+        snapshot = get_snapshot(frigate_event_id, frigate_url, True)
+        if not snapshot:
+            if frigate_event_id in CURRENT_EVENTS:
+                del CURRENT_EVENTS[frigate_event_id] # remove existing id from current events due to snapshot failure - will try again next frame
+            return
     
-    plate_recogniser_response = get_plate(snapshot)
+        plate_recogniser_response = get_plate(snapshot)
 
-    if plate_recogniser_response.data.vehicles:
-        vehicle = plate_recogniser_response.data.vehicles[0]
-        mmr_info = vehicle.mmr
-        plate_info = vehicle.plate
-        if mmr_info.found == True and plate_info.found == True:
-            vehicle_make = mmr_info.make
-            vehicle_model = mmr_info.model
-            plate_number = vehicle.plate.unicodeText
-            make_confidence = mmr_info.makeConfidence
-            model_confidence = mmr_info.modelConfidence
-            plate_confidence = vehicle.plate.confidence
-            _LOGGER.info(f"Detected vehicle: {vehicle_make} {vehicle_model} with licence plate: {plate_number}. Confidence: {make_confidence}, {model_confidence}, {plate_confidence}.")
-            send_mqtt_message(plate_number, frigate_event_id, frigate_review_id, plate_confidence, vehicle_make, vehicle_model)
-        elif plate_info.found == True and mmr_info.found == False: # Detected plate, but not vehicle make and model (MMR)
-            # Access the plate information
-            plate_number = vehicle.plate.unicodeText
-            plate_confidence = vehicle.plate.confidence
-            vehicle_make = 'NONE'
-            vehicle_model = 'NONE'
-            _LOGGER.info(f"Found plate: {plate_number} with confidence {plate_confidence}. Vehicle make and model was not detected.")
-            send_mqtt_message(plate_number, frigate_event_id, frigate_review_id, plate_confidence, vehicle_make, vehicle_model)
-        elif mmr_info.found == True and plate_info.found == False: # Detected vehicle make and model, but not plate number
-            if mmr_info.make != None:
-                # Access the plate information
-                plate_number = 'NONE'
-                plate_confidence = 'none'
+        if plate_recogniser_response.data.vehicles:
+            vehicle = plate_recogniser_response.data.vehicles[0]
+            mmr_info = vehicle.mmr
+            plate_info = vehicle.plate
+            if mmr_info.found == True and plate_info.found == True:
                 vehicle_make = mmr_info.make
                 vehicle_model = mmr_info.model
+                plate_number = vehicle.plate.unicodeText
                 make_confidence = mmr_info.makeConfidence
                 model_confidence = mmr_info.modelConfidence
-                _LOGGER.info(f"Plate not found, but found vehicle: {vehicle_make} {vehicle_model} with confidence {make_confidence}, {model_confidence}")
+                plate_confidence = vehicle.plate.confidence
+                _LOGGER.info(f"Detected vehicle: {vehicle_make} {vehicle_model} with licence plate: {plate_number}. Confidence: {make_confidence}, {model_confidence}, {plate_confidence}.")
                 send_mqtt_message(plate_number, frigate_event_id, frigate_review_id, plate_confidence, vehicle_make, vehicle_model)
-
-            else:
-                _LOGGER.info(f"Vehicle and/or plate has not been found! ")
-                plate_number = 'NONE'
-                plate_confidence = 'none'
+            elif plate_info.found == True and mmr_info.found == False: # Detected plate, but not vehicle make and model (MMR)
+                # Access the plate information
+                plate_number = vehicle.plate.unicodeText
+                plate_confidence = vehicle.plate.confidence
                 vehicle_make = 'NONE'
                 vehicle_model = 'NONE'
+                _LOGGER.info(f"Found plate: {plate_number} with confidence {plate_confidence}. Vehicle make and model was not detected.")
                 send_mqtt_message(plate_number, frigate_event_id, frigate_review_id, plate_confidence, vehicle_make, vehicle_model)
-                return
+            elif mmr_info.found == True and plate_info.found == False: # Detected vehicle make and model, but not plate number
+                if mmr_info.make != None:
+                    # Access the plate information
+                    plate_number = 'NONE'
+                    plate_confidence = 'none'
+                    vehicle_make = mmr_info.make
+                    vehicle_model = mmr_info.model
+                    make_confidence = mmr_info.makeConfidence
+                    model_confidence = mmr_info.modelConfidence
+                    _LOGGER.info(f"Plate not found, but found vehicle: {vehicle_make} {vehicle_model} with confidence {make_confidence}, {model_confidence}")
+                    send_mqtt_message(plate_number, frigate_event_id, frigate_review_id, plate_confidence, vehicle_make, vehicle_model)
 
-    else:
-        _LOGGER.info(f"Vehicle and/or plate has not been found! ")
-        plate_number = 'NONE'
-        plate_confidence = 'none'
-        vehicle_make = 'NONE'
-        vehicle_model = 'NONE'
-        send_mqtt_message(plate_number, frigate_event_id, frigate_review_id, plate_confidence, vehicle_make, vehicle_model)
-        return
+                else:
+                    _LOGGER.info(f"Vehicle and/or plate has not been found! ")
+                    plate_number = 'NONE'
+                    plate_confidence = 'none'
+                    vehicle_make = 'NONE'
+                    vehicle_model = 'NONE'
+                    send_mqtt_message(plate_number, frigate_event_id, frigate_review_id, plate_confidence, vehicle_make, vehicle_model)
+                    return
+
+        else:
+            _LOGGER.info(f"Vehicle and/or plate has not been found! ")
+            plate_number = 'NONE'
+            plate_confidence = 'none'
+            vehicle_make = 'NONE'
+            vehicle_model = 'NONE'
+            send_mqtt_message(plate_number, frigate_event_id, frigate_review_id, plate_confidence, vehicle_make, vehicle_model)
+            return
 
 def setup():
     if config['carmen']['api_key']:
